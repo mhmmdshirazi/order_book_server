@@ -171,7 +171,13 @@ fn fetch_snapshot(
                             }
                             let stored_snapshot = state.compute_snapshot().snapshot;
                             info!("Validating snapshot");
-                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
+                            if let Err(err) =
+                                validate_snapshot_consistency(&stored_snapshot, &expected_snapshot, ignore_spot)
+                            {
+                                error!("Snapshot mismatch at height {height}: {err}. Resetting state from snapshot.");
+                                listener.lock().await.init_from_snapshot(expected_snapshot, height);
+                            }
+                            Ok(())
                         } else {
                             listener.lock().await.init_from_snapshot(expected_snapshot, height);
                             Ok(())

@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
     order_book::{
-        Snapshot,
+        Coin, Snapshot,
         multi_book::{OrderBooks, Snapshots},
         types::InnerOrder,
     },
@@ -44,35 +44,72 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
     Ok(output_path)
 }
 
-pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
+fn validate_side_consistency<O: InnerOrder + PartialEq + Debug>(
+    coin: &Coin,
+    side_label: &str,
+    received_orders: &[O],
+    expected_orders: &[O],
+) -> Result<()> {
+    if received_orders.len() != expected_orders.len() {
+        return Err(format!(
+            "Order count mismatch for {coin:?} {side_label}, expected: {} received: {}",
+            expected_orders.len(),
+            received_orders.len()
+        )
+        .into());
+    }
+    let mut expected_by_oid = HashMap::with_capacity(expected_orders.len());
+    for order in expected_orders {
+        if expected_by_oid.insert(order.oid(), order).is_some() {
+            return Err(format!("Duplicate order oid in expected snapshot for {coin:?} {side_label}: {order:?}").into());
+        }
+    }
+    for order in received_orders {
+        match expected_by_oid.remove(&order.oid()) {
+            None => {
+                return Err(format!("Unexpected order in stored snapshot for {coin:?} {side_label}: {order:?}").into());
+            }
+            Some(expected_order) if expected_order != order => {
+                return Err(format!(
+                    "Order mismatch for {coin:?} {side_label}, expected: {expected_order:?} received: {order:?}"
+                )
+                .into());
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(missing_order) = expected_by_oid.into_values().next() {
+        return Err(format!("Missing order in stored snapshot for {coin:?} {side_label}: {missing_order:?}").into());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_snapshot_consistency<O: InnerOrder + PartialEq + Debug>(
     snapshot: &Snapshots<O>,
-    expected: Snapshots<O>,
+    expected: &Snapshots<O>,
     ignore_spot: bool,
 ) -> Result<()> {
-    let mut snapshot_map: HashMap<_, _> =
-        expected.value().into_iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
+    let mut expected_map: HashMap<_, _> =
+        expected.as_ref().iter().filter(|(coin, _)| !coin.is_spot() || !ignore_spot).collect();
 
     for (coin, book) in snapshot.as_ref() {
         if ignore_spot && coin.is_spot() {
             continue;
         }
-        let book1 = book.as_ref();
-        if let Some(book2) = snapshot_map.remove(coin) {
-            for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
-                for (order1, order2) in orders1.iter().zip(orders2.iter()) {
-                    if *order1 != *order2 {
-                        return Err(
-                            format!("Orders do not match, expected: {:?} received: {:?}", *order2, *order1).into()
-                        );
-                    }
-                }
+        let stored_book = book.as_ref();
+        if let Some(expected_book) = expected_map.remove(coin) {
+            for (i, (stored_orders, expected_orders)) in
+                stored_book.as_ref().iter().zip(expected_book.as_ref()).enumerate()
+            {
+                let side_label = if i == 0 { "bids" } else { "asks" };
+                validate_side_consistency(coin, side_label, stored_orders, expected_orders)?;
             }
-        } else if !book1[0].is_empty() || !book1[1].is_empty() {
+        } else if !stored_book[0].is_empty() || !stored_book[1].is_empty() {
             return Err(format!("Missing {} book", coin.value()).into());
         }
     }
-    if !snapshot_map.is_empty() {
-        return Err("Extra orderbooks detected".to_string().into());
+    if let Some((coin, _)) = expected_map.into_iter().next() {
+        return Err(format!("Extra orderbook detected: {}", coin.value()).into());
     }
     Ok(())
 }
