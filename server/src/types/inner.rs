@@ -43,6 +43,10 @@ impl InnerOrder for InnerL4Order {
         self.limit_px
     }
 
+    fn modify_limit_px(&mut self, px: Px) {
+        self.limit_px = px;
+    }
+
     fn sz(&self) -> Sz {
         self.sz
     }

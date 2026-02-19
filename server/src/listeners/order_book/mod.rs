@@ -286,10 +286,22 @@ impl OrderBookListener {
         }
         if self.is_ready() {
             if let Some((order_statuses, order_diffs)) = self.pop_cache() {
-                self.order_book_state
+                if let Err(err) = self
+                    .order_book_state
                     .as_mut()
                     .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
-                    .transpose()?;
+                    .transpose()
+                {
+                    error!(
+                        "Failed to apply updates at block {}: {err}. Entering recovery mode until next snapshot.",
+                        order_statuses.block_number()
+                    );
+                    // State diverged from stream (e.g. missing block range). Drop local state and
+                    // rely on the next snapshot cycle to rebuild from a consistent height.
+                    self.order_book_state = None;
+                    self.fetched_snapshot_cache = None;
+                    return Ok(());
+                }
                 if let Some(cache) = &mut self.fetched_snapshot_cache {
                     cache.push_back((order_statuses.clone(), order_diffs.clone()));
                 }

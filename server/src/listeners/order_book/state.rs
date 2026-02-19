@@ -90,6 +90,7 @@ impl OrderBookState {
         while let Some(diff) = diffs.pop_front() {
             let oid = diff.oid();
             let coin = diff.coin();
+            let px = diff.px()?;
             if coin.is_spot() && self.ignore_spot {
                 continue;
             }
@@ -109,7 +110,7 @@ impl OrderBookState {
                     }
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
-                    if !self.order_book.modify_sz(oid, coin, new_sz) {
+                    if !self.order_book.modify_order(oid, coin, px, new_sz) {
                         return Err(format!("Unable to find order on the book {diff:?}").into());
                     }
                 }

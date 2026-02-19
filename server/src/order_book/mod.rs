@@ -111,6 +111,41 @@ impl<O: InnerOrder> OrderBook<O> {
         false
     }
 
+    pub(crate) fn modify_order(&mut self, oid: Oid, new_px: Px, new_sz: Sz) -> bool {
+        let Some((side, old_px)) = self.oid_to_side_px.get(&oid).cloned() else {
+            return false;
+        };
+        if old_px == new_px {
+            return self.modify_sz(oid, new_sz);
+        }
+
+        let old_book = match side {
+            Side::Ask => &mut self.asks,
+            Side::Bid => &mut self.bids,
+        };
+        let Some(old_list) = old_book.get_mut(&old_px) else {
+            return false;
+        };
+        let Some(mut moved_order) = old_list.node_value_mut(&oid).cloned() else {
+            return false;
+        };
+        moved_order.modify_limit_px(new_px);
+        moved_order.modify_sz(new_sz);
+        if !old_list.remove_node(oid.clone()) {
+            return false;
+        }
+        if old_list.is_empty() {
+            old_book.remove(&old_px);
+        }
+        self.oid_to_side_px.insert(oid.clone(), (side, new_px));
+        let new_book = match side {
+            Side::Ask => &mut self.asks,
+            Side::Bid => &mut self.bids,
+        };
+        add_order_to_book(new_book, moved_order);
+        true
+    }
+
     // we go by the convention that prioritized orders go first in the vector; this makes aggregation step later easier.
     pub(crate) fn to_snapshot(&self) -> Snapshot<O> {
         let bids = self.bids.iter().rev().flat_map(|(_, l)| l.to_vec().into_iter().cloned()).collect_vec();
@@ -205,6 +240,10 @@ mod tests {
 
         fn limit_px(&self) -> Px {
             Px::new(self.limit_px)
+        }
+
+        fn modify_limit_px(&mut self, px: Px) {
+            self.limit_px = px.value();
         }
 
         fn sz(&self) -> Sz {
@@ -304,6 +343,23 @@ mod tests {
         asks[0].sz = 450;
 
         assert_same_book(Snapshot([bids.clone(), asks.clone()]), book.to_snapshot());
+    }
+
+    #[test]
+    fn modify_order_moves_price_level() {
+        let mut book = OrderBook::new();
+        let mut factory = OrderFactory::default();
+        let order = factory.order(100, 1_000, Side::Ask);
+        let oid = order.oid();
+        book.add_order(order);
+
+        assert!(book.modify_order(oid, Px::new(1_250), Sz::new(90)));
+
+        let snapshot = book.to_snapshot();
+        let asks = &snapshot.as_ref()[1];
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].limit_px(), Px::new(1_250));
+        assert_eq!(asks[0].sz(), Sz::new(90));
     }
 
     fn assert_same_book(s1: Snapshot<MinimalOrder>, s2: Snapshot<MinimalOrder>) {
