@@ -14,7 +14,7 @@ use crate::{
 };
 use alloy::primitives::Address;
 use fs::File;
-use log::{error, info};
+use log::{error, info, warn};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     cmp::Ordering,
@@ -122,10 +122,10 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                 fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
             }
-            () = sleep(Duration::from_secs(5)) => {
+            () = sleep(Duration::from_secs(30)) => {
                 let listener = listener.lock().await;
                 if listener.is_ready() {
-                    return Err(format!("Stream has fallen behind ({HL_NODE} failed?)").into());
+                    warn!("No filesystem updates for 30s ({HL_NODE} may be behind), continuing with snapshots");
                 }
             }
         }
