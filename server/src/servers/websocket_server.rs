@@ -3,13 +3,14 @@ use crate::{
     prelude::*,
     types::{
         Trade,
-        subscription::{ClientMessage, ServerResponse, Subscription, SubscriptionManager},
+        subscription::{ClientMessage, ServerResponse, Subscription},
     },
 };
 use axum::{Router, response::IntoResponse, routing::get};
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info};
-use std::{env::home_dir, sync::Arc};
+use log::{debug, error, info};
+use serde::Serialize;
+use std::{collections::HashSet, env::home_dir, sync::Arc};
 use tokio::select;
 use tokio::{
     net::TcpListener,
@@ -75,15 +76,15 @@ fn ws_handler(
 
 async fn handle_socket(mut socket: WebSocket, trade_tx: Sender<Arc<Trade>>) {
     let mut trade_rx = trade_tx.subscribe();
-    let mut manager = SubscriptionManager::default();
+    let mut subscribed_coins = HashSet::<String>::new();
 
     loop {
         select! {
             recv_result = trade_rx.recv() => {
                 match recv_result {
                     Ok(trade) => {
-                        for sub in manager.subscriptions() {
-                            send_ws_data_from_trade(&mut socket, sub, &trade).await;
+                        if subscribed_coins.contains(trade.coin.as_str()) {
+                            send_trade_message(&mut socket, &trade).await;
                         }
                     }
                     Err(err) => {
@@ -104,23 +105,23 @@ async fn handle_socket(mut socket: WebSocket, trade_tx: Sender<Arc<Trade>>) {
                                 }
                             };
 
-                            info!("Client message: {text}");
+                            debug!("Client message: {text}");
 
                             if let Ok(value) = serde_json::from_str::<ClientMessage>(text) {
-                                receive_client_message(&mut socket, &mut manager, value).await;
+                                receive_client_message(&mut socket, &mut subscribed_coins, value).await;
                             } else {
                                 let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
                                 send_socket_message(&mut socket, msg).await;
                             }
                         }
                         OpCode::Close => {
-                            info!("Client disconnected");
+                            debug!("Client disconnected");
                             return;
                         }
                         _ => {}
                     }
                 } else {
-                    info!("Client connection closed");
+                    debug!("Client connection closed");
                     return;
                 }
             }
@@ -130,33 +131,54 @@ async fn handle_socket(mut socket: WebSocket, trade_tx: Sender<Arc<Trade>>) {
 
 async fn receive_client_message(
     socket: &mut WebSocket,
-    manager: &mut SubscriptionManager,
+    subscribed_coins: &mut HashSet<String>,
     client_message: ClientMessage,
 ) {
-    let subscription = match &client_message {
-        ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription,
-    };
-
-    if !matches!(subscription, Subscription::Trades { coin } if !coin.is_empty()) {
-        let msg = ServerResponse::Error(
-            "Only non-empty trades subscriptions are supported by this websocket server".to_string(),
-        );
-        send_socket_message(socket, msg).await;
-        return;
-    }
-
-    let sub = serde_json::to_string(subscription).unwrap_or_default();
-    let (word, success) = match &client_message {
-        ClientMessage::Subscribe { subscription } => ("", manager.subscribe(subscription.clone())),
-        ClientMessage::Unsubscribe { subscription } => ("un", manager.unsubscribe(subscription.clone())),
-    };
-
-    if success {
-        let msg = ServerResponse::SubscriptionResponse(client_message);
-        send_socket_message(socket, msg).await;
-    } else {
-        let msg = ServerResponse::Error(format!("Already {word}subscribed: {sub}"));
-        send_socket_message(socket, msg).await;
+    match client_message {
+        ClientMessage::Subscribe { subscription } => {
+            let sub = serde_json::to_string(&subscription).unwrap_or_default();
+            let coin = match subscription {
+                Subscription::Trades { coin } if !coin.is_empty() => coin,
+                _ => {
+                    let msg = ServerResponse::Error(
+                        "Only non-empty trades subscriptions are supported by this websocket server".to_string(),
+                    );
+                    send_socket_message(socket, msg).await;
+                    return;
+                }
+            };
+            if subscribed_coins.insert(coin.clone()) {
+                let msg = ServerResponse::SubscriptionResponse(ClientMessage::Subscribe {
+                    subscription: Subscription::Trades { coin },
+                });
+                send_socket_message(socket, msg).await;
+            } else {
+                let msg = ServerResponse::Error(format!("Already subscribed: {sub}"));
+                send_socket_message(socket, msg).await;
+            }
+        }
+        ClientMessage::Unsubscribe { subscription } => {
+            let sub = serde_json::to_string(&subscription).unwrap_or_default();
+            let coin = match subscription {
+                Subscription::Trades { coin } if !coin.is_empty() => coin,
+                _ => {
+                    let msg = ServerResponse::Error(
+                        "Only non-empty trades subscriptions are supported by this websocket server".to_string(),
+                    );
+                    send_socket_message(socket, msg).await;
+                    return;
+                }
+            };
+            if subscribed_coins.remove(&coin) {
+                let msg = ServerResponse::SubscriptionResponse(ClientMessage::Unsubscribe {
+                    subscription: Subscription::Trades { coin },
+                });
+                send_socket_message(socket, msg).await;
+            } else {
+                let msg = ServerResponse::Error(format!("Already unsubscribed: {sub}"));
+                send_socket_message(socket, msg).await;
+            }
+        }
     }
 }
 
@@ -174,11 +196,22 @@ async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
     }
 }
 
-async fn send_ws_data_from_trade(socket: &mut WebSocket, subscription: &Subscription, trade: &Arc<Trade>) {
-    if let Subscription::Trades { coin } = subscription {
-        if coin == &trade.coin {
-            let msg = ServerResponse::Trades(vec![trade.as_ref().clone()]);
-            send_socket_message(socket, msg).await;
+#[derive(Serialize)]
+struct SingleTradeMessage<'a> {
+    channel: &'static str,
+    data: [&'a Trade; 1],
+}
+
+async fn send_trade_message(socket: &mut WebSocket, trade: &Trade) {
+    let msg = SingleTradeMessage { channel: "trades", data: [trade] };
+    match serde_json::to_string(&msg) {
+        Ok(msg) => {
+            if let Err(err) = socket.send(FrameView::text(msg)).await {
+                error!("Failed to send: {err}");
+            }
+        }
+        Err(err) => {
+            error!("Server response serialization error: {err}");
         }
     }
 }

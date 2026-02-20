@@ -3,29 +3,31 @@ use crate::{
     prelude::*,
     types::{
         Fill, Trade,
-        node_data::{Batch, EventSource, NodeDataFill},
+        node_data::{Batch, NodeDataFill},
     },
 };
 use alloy::primitives::Address;
 use chrono::{DateTime, NaiveDateTime};
 use fs::File;
-use log::{error, info};
+use log::{error, info, warn};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    env,
     io::{Read, Seek, SeekFrom},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::sync::{
     broadcast::Sender,
     mpsc::{UnboundedSender, unbounded_channel},
 };
+use tokio::time::{Duration, sleep};
 
 pub(crate) async fn hl_listen(trade_tx: Sender<Arc<Trade>>, dir: PathBuf) -> Result<()> {
-    let fills_dir = EventSource::Fills.event_source_dir(&dir).canonicalize()?;
+    let fills_dir = wait_for_trade_dir(&dir).await?;
     info!("Monitoring fills directory: {}", fills_dir.display());
 
     let mut listener = TradeRelayListener::new(trade_tx);
@@ -55,6 +57,48 @@ pub(crate) async fn hl_listen(trade_tx: Sender<Arc<Trade>>, dir: PathBuf) -> Res
             }
         }
     }
+}
+
+async fn wait_for_trade_dir(home_dir: &Path) -> Result<PathBuf> {
+    let mut attempts = 0_u64;
+    loop {
+        if let Ok(custom_dir) = env::var("HL_TRADE_RELAY_DIR") {
+            let custom_path = PathBuf::from(custom_dir);
+            if custom_path.exists() {
+                return Ok(custom_path.canonicalize()?);
+            }
+            if attempts == 0 || attempts % 30 == 0 {
+                warn!("`HL_TRADE_RELAY_DIR` is set but does not exist yet: {}", custom_path.display());
+            }
+        }
+
+        for candidate in candidate_trade_dirs(home_dir) {
+            if candidate.exists() {
+                return Ok(candidate.canonicalize()?);
+            }
+        }
+
+        if attempts == 0 || attempts % 30 == 0 {
+            warn!(
+                "Waiting for trade output directory under {} (expected one of node_fills/node_fills_by_block/node_trades)",
+                home_dir.join("hl/data").display()
+            );
+        }
+        attempts += 1;
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn candidate_trade_dirs(home_dir: &Path) -> Vec<PathBuf> {
+    let data = home_dir.join("hl/data");
+    vec![
+        data.join("node_fills"),
+        data.join("node_fills/hourly"),
+        data.join("node_fills_by_block"),
+        data.join("node_fills_by_block/hourly"),
+        data.join("node_trades"),
+        data.join("node_trades/hourly"),
+    ]
 }
 
 fn send_fs_event(
