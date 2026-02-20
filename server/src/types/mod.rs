@@ -57,6 +57,19 @@ impl L2Book {
 }
 
 impl Trade {
+    pub(crate) fn from_parts(
+        coin: String,
+        side: Side,
+        px: String,
+        sz: String,
+        hash: String,
+        time: u64,
+        tid: u64,
+        users: [Address; 2],
+    ) -> Self {
+        Self { coin, side, px, sz, hash, time, tid, users }
+    }
+
     #[allow(clippy::unwrap_used)]
     pub(crate) fn from_fills(mut fills: HashMap<Side, NodeDataFill>) -> Self {
         let NodeDataFill(seller, ask_fill) = fills.remove(&Side::Ask).unwrap();
@@ -72,7 +85,7 @@ impl Trade {
         let hash = ask_fill.hash;
         let time = ask_fill.time;
         let users = [buyer, seller];
-        Self { coin, side, px, sz, hash, time, tid, users }
+        Self::from_parts(coin, side, px, sz, hash, time, tid, users)
     }
 }
 
