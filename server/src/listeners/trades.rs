@@ -113,12 +113,13 @@ fn send_fs_event(
 struct TradeRelayListener {
     fill_file: Option<File>,
     pending_fills: HashMap<u64, HashMap<Side, NodeDataFill>>,
+    partial_line: String,
     trade_tx: Sender<Arc<Trade>>,
 }
 
 impl TradeRelayListener {
     fn new(trade_tx: Sender<Arc<Trade>>) -> Self {
-        Self { fill_file: None, pending_fills: HashMap::new(), trade_tx }
+        Self { fill_file: None, pending_fills: HashMap::new(), partial_line: String::new(), trade_tx }
     }
 
     fn process_update(&mut self, event: &Event, new_path: &PathBuf) -> Result<()> {
@@ -141,6 +142,9 @@ impl TradeRelayListener {
             if !buf.is_empty() {
                 self.process_data(buf)?;
             }
+            // Previous file is finalized now; if it ended without a newline, process it as a
+            // complete final record instead of waiting for bytes from the next file.
+            self.flush_partial_line_on_rotation();
         }
         self.fill_file = Some(File::open(new_file)?);
         Ok(())
@@ -155,21 +159,24 @@ impl TradeRelayListener {
     }
 
     fn process_data(&mut self, data: String) -> Result<()> {
-        let total_len = data.len();
-        for line in data.lines() {
+        self.partial_line.push_str(&data);
+        let chunk = std::mem::take(&mut self.partial_line);
+        let has_trailing_newline = chunk.ends_with('\n');
+        let mut lines = chunk.split('\n').collect::<Vec<_>>();
+        if !has_trailing_newline {
+            self.partial_line = lines.pop().unwrap_or_default().to_string();
+        }
+
+        for line in lines {
+            let line = line.trim_end_matches('\r');
             if line.is_empty() {
                 continue;
             }
             let events = match parse_trade_events(line) {
                 Ok(events) => events,
                 Err(err) => {
-                    error!("Fills serialization error: {err}, line: {:?}", &line[..100.min(line.len())]);
-                    #[allow(clippy::unwrap_used)]
-                    let total_len: i64 = total_len.try_into().unwrap();
-                    if let Some(file) = self.fill_file.as_mut() {
-                        let _unused = file.seek_relative(-total_len);
-                    }
-                    break;
+                    warn!("Skipping unparsable fills line: {err}, line: {:?}", &line[..100.min(line.len())]);
+                    continue;
                 }
             };
             self.process_events(events);
@@ -196,6 +203,23 @@ impl TradeRelayListener {
             if let Some(fills) = self.pending_fills.remove(&tid) {
                 let trade = Trade::from_fills(fills);
                 let _unused = self.trade_tx.send(Arc::new(trade));
+            }
+        }
+    }
+
+    fn flush_partial_line_on_rotation(&mut self) {
+        if self.partial_line.is_empty() {
+            return;
+        }
+        let line = std::mem::take(&mut self.partial_line);
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            return;
+        }
+        match parse_trade_events(line) {
+            Ok(events) => self.process_events(events),
+            Err(err) => {
+                warn!("Dropping incomplete or invalid trailing fills line during file rotation: {err}");
             }
         }
     }
